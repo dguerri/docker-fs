@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"syscall"
 
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/client"
 	"github.com/plesk/docker-fs/lib/log"
 
 	"github.com/plesk/docker-fs/lib/dockerfs"
@@ -35,30 +38,15 @@ func New() *Manager {
 	}
 }
 
-func (m *Manager) ListContainers() ([]Container, error) {
-	httpc, err := dockerfs.NewClient("unix:/var/run/docker.sock")
+func (m *Manager) ListContainers() (container_list []types.Container, err error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, err
 	}
-	dmng := dockerfs.NewDockerMng(httpc, "")
-	list, err := dmng.ContainersList()
-	if err != nil {
-		return nil, err
-	}
-	status, err := m.readStatus()
-	if err != nil {
-		return nil, err
-	}
-	var result []Container
-	for _, c := range list {
-		ct := FromContainer(&c)
-		if s, ok := status[ct.Id]; ok {
-			ct.MountPoint = s
-			ct.Mounted = ct.MountPoint != ""
-		}
-		result = append(result, ct)
-	}
-	return result, nil
+
+	container_list, err = cli.ContainerList(ctx, types.ContainerListOptions{})
+	return
 }
 
 func (m *Manager) MountContainer(containerId, mountPoint string, daemonize bool) error {
@@ -70,7 +58,7 @@ func (m *Manager) MountContainer(containerId, mountPoint string, daemonize bool)
 		ctx := daemon.Context{}
 		child, err := ctx.Reborn()
 		if err != nil {
-			return fmt.Errorf("Daemonization failed: %w", err)
+			return fmt.Errorf("daemonization failed: %w", err)
 		}
 		if child != nil {
 			// parent process
@@ -93,7 +81,7 @@ func (m *Manager) MountContainer(containerId, mountPoint string, daemonize bool)
 	log.Printf("[info] Mounting FS to %v...", mountPoint)
 	server, err := fs.Mount(mountPoint, root, &fs.Options{})
 	if err != nil {
-		return fmt.Errorf("Mount failed: %w", err)
+		return fmt.Errorf("mount failed: %w", err)
 	}
 
 	log.Printf("[info] Setting up signal handler...")
@@ -118,7 +106,7 @@ func (m *Manager) UnmountContainer(id, path string) error {
 
 func (m *Manager) writeStatus(id, path string) error {
 	fmt.Printf("write status: %q = %q\n", id, path)
-	status, err := m.readStatus()
+	status, err := m.ReadStatus()
 	if err != nil {
 		return err
 	}
@@ -139,7 +127,7 @@ func (m *Manager) writeStatus(id, path string) error {
 	return ioutil.WriteFile(m.statusPath, data, 0644)
 }
 
-func (m *Manager) readStatus() (map[string]string, error) {
+func (m *Manager) ReadStatus() (map[string]string, error) {
 	data, err := ioutil.ReadFile(m.statusPath)
 	if os.IsNotExist(err) {
 		return map[string]string{}, nil

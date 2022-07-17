@@ -2,12 +2,12 @@ package dockerfs
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 
+	"github.com/docker/docker/api/types"
 	"github.com/plesk/docker-fs/lib/log"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -38,8 +38,8 @@ func (d *Dir) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (n *f
 	defer log.Printf("[debug] Dir (%s) Lookup(%s): %v", d.fullpath, name, syserr)
 	path := filepath.Join(d.fullpath, name)
 
-	attrs, err := d.mng.docker.GetPathAttrs(path)
-	if errors.As(err, &ErrorNotFound{}) {
+	attrs, err := d.mng.docker.GetPathAttrs(ctx, path)
+	if err != nil && strings.HasSuffix(err.Error(), "404") {
 		return nil, syscall.ENOENT
 	}
 	if err != nil {
@@ -86,7 +86,7 @@ func (d *Dir) Create(ctx context.Context, name string, flags uint32, mode uint32
 		fullpath: path,
 		// Allow fsync on this file
 		write: true,
-		stat: &ContainerPathStat{
+		stat: &types.ContainerPathStat{
 			Mode: os.FileMode(mode),
 		},
 	}
@@ -105,7 +105,7 @@ func (d *Dir) Readdir(ctx context.Context) (ds fs.DirStream, syserr syscall.Errn
 		path = path + "/"
 	}
 
-	changes, err := d.mng.ChangesInDir(d.fullpath)
+	changes, err := d.mng.ChangesInDir(ctx, d.fullpath)
 	if err != nil {
 		log.Printf("[error] Cannot retrieve FS changes: %v", err)
 		return nil, syscall.EIO
@@ -117,7 +117,7 @@ func (d *Dir) Readdir(ctx context.Context) (ds fs.DirStream, syserr syscall.Errn
 			continue
 		}
 		// Check if file is removed
-		if changes.WasRemoved(name) {
+		if WasRemoved(name, changes) {
 			continue
 		}
 		sub := name[len(path):]
@@ -140,9 +140,17 @@ func (d *Dir) Readdir(ctx context.Context) (ds fs.DirStream, syserr syscall.Errn
 		if ch.Kind != FileAdded {
 			continue
 		}
-		log.Printf("[trace] Readdir (3): childred[%v] = %o", filepath.Base(ch.Path), ch.mode)
+		stat, err := d.mng.docker.GetPathAttrs(ctx, ch.Path)
+		if err != nil {
+			if err != nil && strings.HasSuffix(err.Error(), "404") {
+				log.Printf("[error] Failed to get raw attrs of %q: %v", ch.Path, err)
+			}
+			continue
+		}
+		mode := uint32(stat.Mode)
+		log.Printf("[trace] Readdir (3): childred[%v] = %o", filepath.Base(ch.Path), mode)
 		fuseMode := uint32(fuse.S_IFREG)
-		if os.FileMode(ch.mode).IsDir() {
+		if os.FileMode(mode).IsDir() {
 			fuseMode = fuse.S_IFDIR
 		}
 		children[filepath.Base(ch.Path)] = fuseMode

@@ -43,6 +43,11 @@ func (t *Tui) list() error {
 		return err
 	}
 
+	status, err := t.mng.ReadStatus()
+	if err != nil {
+		return err
+	}
+
 	sel := promptui.Select{
 		Label:     "Label",
 		Items:     cts,
@@ -53,15 +58,15 @@ func (t *Tui) list() error {
 		return err
 	}
 	ct := cts[i]
-	if ct.Mounted {
+	if mp, ok := status[ct.ID]; ok {
 		// ask to unmount
 		sel := promptui.Select{
 			Label: struct {
 				Id string
 				Mp string
 			}{
-				Id: ct.ShortId,
-				Mp: ct.MountPoint,
+				Id: ct.ID,
+				Mp: mp,
 			},
 			Items: []string{
 				"Yes",
@@ -78,14 +83,14 @@ func (t *Tui) list() error {
 			return nil
 		}
 		// unmounting
-		if err := t.mng.UnmountContainer(ct.Id, ct.MountPoint); err != nil {
+		if err := t.mng.UnmountContainer(ct.ID, mp); err != nil {
 			return err
 		}
 	} else {
 		// Mounting
 		promptPath := promptui.Prompt{
 			Label:     "Choose path to mount docker container",
-			Default:   fmt.Sprintf("./mount-%v", cts[i].Name),
+			Default:   fmt.Sprintf("./mount-%v", cts[i].Names[0]),
 			AllowEdit: true,
 		}
 
@@ -99,7 +104,7 @@ func (t *Tui) list() error {
 			return fmt.Errorf("Cannot detect executable path: %w", err)
 		}
 
-		cmd := exec.Command(executable, "-id", cts[i].Id, "-mount", mountPoint, "-daemonize")
+		cmd := exec.Command(executable, "-id", cts[i].ID, "-mount", mountPoint, "-daemonize")
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("Mount command failed: %w", err)
 		}

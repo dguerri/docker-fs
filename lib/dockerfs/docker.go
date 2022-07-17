@@ -3,150 +3,79 @@ package dockerfs
 import (
 	"archive/tar"
 	"bytes"
-	"encoding/base64"
-	"encoding/json"
-	"fmt"
+	"context"
 	"io"
-	"io/ioutil"
-	"net/http"
 	"path/filepath"
-	"strings"
 	"time"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 )
 
 type dockerMng interface {
 	// returns read-closer to tar-archive fetched by /containers/{id}/export api method
-	ContainerExport() (io.ReadCloser, error)
+	ContainerExport(ctx context.Context) (io.ReadCloser, error)
 
-	GetPathAttrs(path string) (*ContainerPathStat, error)
+	GetPathAttrs(ctx context.Context, path string) (types.ContainerPathStat, error)
 
-	GetFsChanges() (FsChanges, error)
+	GetFsChanges(ctx context.Context) ([]container.ContainerChangeResponseItem, error)
 
 	// Get plain file content
-	GetFile(path string) (io.ReadCloser, error)
+	GetFile(ctx context.Context, path string) (io.ReadCloser, error)
 
 	// Save file
-	SaveFile(path string, data []byte, stat *ContainerPathStat) (err error)
+	SaveFile(ctx context.Context, path string, data []byte, stat *types.ContainerPathStat) (err error)
 
 	// List containers
-	ContainersList() ([]Container, error)
+	ContainersList(ctx context.Context) ([]types.Container, error)
 }
 
 var _ = (dockerMng)((*dockerMngImpl)(nil))
 
 type dockerMngImpl struct {
-	httpc httpClient
-	id    string
+	dockerClient *client.Client
+	id           string
 }
 
-func NewDockerMng(httpc httpClient, containerId string) dockerMng {
+func NewDockerMng(cli *client.Client, containerId string) dockerMng {
 	return &dockerMngImpl{
-		httpc: httpc,
-		id:    containerId,
+		dockerClient: cli,
+		id:           containerId,
 	}
 }
 
-func (d *dockerMngImpl) ContainerExport() (io.ReadCloser, error) {
-	resp, err := d.httpc.Get("/containers/" + d.id + "/export")
-	if err != nil {
-		return nil, err
-	}
-	return resp.Body, nil
+func (d *dockerMngImpl) ContainerExport(ctx context.Context) (readr io.ReadCloser, err error) {
+	readr, err = d.dockerClient.ContainerExport(ctx, d.id)
+	return
 }
 
-func (d *dockerMngImpl) GetPathAttrs(path string) (*ContainerPathStat, error) {
-	url := "/containers/" + d.id + "/archive?path=" + path
-	resp, err := d.httpc.Head(url)
-	if err != nil {
-		return nil, fmt.Errorf("Head request to %q failed: %w", url, err)
-	}
-	stat := resp.Header.Get("X-Docker-Container-Path-Stat")
-	if stat == "" {
-		return nil, fmt.Errorf("X-Docker-Container-Path-Stat header not found")
-	}
-	data := new(ContainerPathStat)
-	err = json.NewDecoder(base64.NewDecoder(base64.StdEncoding, strings.NewReader(stat))).Decode(data)
-	if err != nil {
-		return nil, fmt.Errorf("Decoding failed: %q, %w", stat, err)
-	}
-	return data, nil
+func (d *dockerMngImpl) GetPathAttrs(ctx context.Context, path string) (path_stat types.ContainerPathStat, err error) {
+	path_stat, err = d.dockerClient.ContainerStatPath(ctx, d.id, path)
+	return
 }
 
-func (d *dockerMngImpl) GetFsChanges() (FsChanges, error) {
-	resp, err := d.httpc.Get("/containers/" + d.id + "/changes")
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	changes := FsChanges([]FsChange{})
-	if err := json.NewDecoder(resp.Body).Decode(&changes); err != nil {
-		return nil, err
-	}
-	return changes, nil
+func (d *dockerMngImpl) GetFsChanges(ctx context.Context) (changes []container.ContainerChangeResponseItem, err error) {
+	changes, err = d.dockerClient.ContainerDiff(ctx, d.id)
+	return
 }
 
-func (d *dockerMngImpl) GetFile(path string) (io.ReadCloser, error) {
-	url := "/containers/" + d.id + "/archive?path=" + path
-	resp, err := d.httpc.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("Head request to %q failed: %w", url, err)
-	}
-	tr := tar.NewReader(resp.Body)
-	if _, err := tr.Next(); err != nil {
-		return nil, fmt.Errorf("Failed to find file in tar archive: %w", err)
-	}
-	return &readCloser{
-		reader: tr,
-		close: func() error {
-			return resp.Body.Close()
-		},
-	}, nil
+func (d *dockerMngImpl) GetFile(ctx context.Context, path string) (readr io.ReadCloser, err error) {
+	readr, _, err = d.dockerClient.CopyFromContainer(ctx, d.id, path)
+	return
 }
 
-func (d *dockerMngImpl) ContainersList() ([]Container, error) {
-	url := "/containers/json"
-	resp, err := d.httpc.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("Get request to %q failed: %w", url, err)
-	}
-	defer resp.Body.Close()
-	data, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var cts []Container
-	if err := json.Unmarshal(data, &cts); err != nil {
-		return nil, err
-	}
-	return cts, nil
-}
-
-type readCloser struct {
-	reader io.Reader
-	close  func() error
-}
-
-func (rc *readCloser) Read(p []byte) (n int, err error) {
-	return rc.reader.Read(p)
-}
-
-func (rc *readCloser) Close() error {
-	return rc.close()
+func (d *dockerMngImpl) ContainersList(ctx context.Context) (container_list []types.Container, err error) {
+	container_list, err = d.dockerClient.ContainerList(ctx, types.ContainerListOptions{})
+	return
 }
 
 // Save file content.
-// Currently supports only modification of existing files.
-func (d *dockerMngImpl) SaveFile(path string, data []byte, stat *ContainerPathStat) (err error) {
-	if stat == nil {
-		stat, err = d.GetPathAttrs(path)
-		if err != nil {
-			return err
-		}
-	}
-
+func (d *dockerMngImpl) SaveFile(ctx context.Context, path string, data []byte, stat *types.ContainerPathStat) (err error) {
 	var buffer bytes.Buffer
 	writer := tar.NewWriter(&buffer)
+	defer writer.Close()
+
 	dir, name := filepath.Split(path)
 	hdr := &tar.Header{
 		Name:    name,
@@ -160,11 +89,8 @@ func (d *dockerMngImpl) SaveFile(path string, data []byte, stat *ContainerPathSt
 	if _, err := writer.Write(data); err != nil {
 		return err
 	}
-	if err := writer.Close(); err != nil {
-		return err
-	}
+	reader := tar.NewReader(bytes.NewReader(buffer.Bytes()))
+	err = d.dockerClient.CopyToContainer(ctx, d.id, dir, reader, types.CopyToContainerOptions{})
 
-	url := "/containers/" + d.id + "/archive?path=" + dir
-	_, err = d.httpc.Put(url, http.DetectContentType(buffer.Bytes()), &buffer)
-	return err
+	return
 }

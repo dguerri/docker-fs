@@ -1,11 +1,13 @@
 package dockerfs
 
 import (
+	"archive/tar"
 	"context"
-	"errors"
 	"io/ioutil"
+	"strings"
 	"syscall"
 
+	"github.com/docker/docker/api/types"
 	"github.com/plesk/docker-fs/lib/log"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -27,14 +29,14 @@ type File struct {
 	data        []byte
 	read, write bool
 	pos         int64
-	stat        *ContainerPathStat
+	stat        *types.ContainerPathStat
 }
 
 func (f *File) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, mode uint32, syserr syscall.Errno) {
 	defer log.Printf("[debug] File (%s) Open(%o): %v", f.fullpath, flags, syserr)
 	// Fetch file content
-	reader, err := f.mng.docker.GetFile(f.fullpath)
-	if errors.As(err, &ErrorNotFound{}) {
+	reader, err := f.mng.docker.GetFile(ctx, f.fullpath)
+	if err != nil && strings.HasSuffix(err.Error(), "404") {
 		return nil, 0, syscall.ENOENT
 	}
 	if err != nil {
@@ -42,6 +44,11 @@ func (f *File) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, mode u
 		return nil, 0, syscall.EIO
 	}
 	defer reader.Close()
+	tr := tar.NewReader(reader)
+	if _, err := tr.Next(); err != nil {
+		return nil, 0, syscall.EIO
+	}
+
 	data, err := ioutil.ReadAll(reader)
 	if err != nil {
 		log.Printf("[error] Failed to read file from tar archive for %q: %v", f.fullpath, err)
@@ -51,15 +58,15 @@ func (f *File) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, mode u
 
 	// load mode
 	// TODO make a single API call to retrieve file content and attributes
-	attrs, err := f.mng.docker.GetPathAttrs(f.fullpath)
-	if errors.As(err, &ErrorNotFound{}) {
+	attrs, err := f.mng.docker.GetPathAttrs(ctx, f.fullpath)
+	if err != nil && strings.HasSuffix(err.Error(), "404") {
 		return nil, 0, syscall.ENOENT
 	}
 	if err != nil {
 		log.Printf("[error] Failed to get file attributes for %q: %v", f.fullpath, err)
 		return nil, 0, syscall.EIO
 	}
-	f.stat = attrs
+	f.stat = &attrs
 
 	// check flags
 	if (flags&syscall.O_RDONLY) == syscall.O_RDONLY || (flags&syscall.O_RDWR) == syscall.O_RDWR {
@@ -93,8 +100,8 @@ func (f *File) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int6
 
 func (f *File) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) (syserr syscall.Errno) {
 	defer log.Printf("[debug] File (%s) Getattr(): %v", f.fullpath, syserr)
-	attrs, err := f.mng.docker.GetPathAttrs(f.fullpath)
-	if errors.As(err, &ErrorNotFound{}) {
+	attrs, err := f.mng.docker.GetPathAttrs(ctx, f.fullpath)
+	if err != nil && strings.HasSuffix(err.Error(), "404") {
 		return syscall.ENOENT
 	}
 	if err != nil {
@@ -138,7 +145,7 @@ func (f *File) Flush(ctx context.Context, fh fs.FileHandle) (res syscall.Errno) 
 	if !f.write {
 		return 0
 	}
-	if err := f.mng.docker.SaveFile(f.fullpath, f.data, f.stat); err != nil {
+	if err := f.mng.docker.SaveFile(ctx, f.fullpath, f.data, f.stat); err != nil {
 		log.Printf("[error] Failed to save file: %v", err)
 		return syscall.EIO
 	}
@@ -153,7 +160,7 @@ func (f *File) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) (res s
 	if !f.write {
 		return 0
 	}
-	if err := f.mng.docker.SaveFile(f.fullpath, f.data, f.stat); err != nil {
+	if err := f.mng.docker.SaveFile(ctx, f.fullpath, f.data, f.stat); err != nil {
 		log.Printf("[error] Failed to save file: %v", err)
 		return syscall.EIO
 	}

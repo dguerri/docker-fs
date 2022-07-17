@@ -2,7 +2,7 @@ package dockerfs
 
 import (
 	"archive/tar"
-	"errors"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,14 +10,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
 	"github.com/plesk/docker-fs/lib/log"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 )
 
 type Mng struct {
-	dockerAddr string
-	docker     dockerMng
+	docker dockerMng
 
 	id string
 
@@ -25,7 +26,7 @@ type Mng struct {
 
 	staticFiles map[string]os.FileMode
 
-	changes               FsChanges
+	changes               []container.ContainerChangeResponseItem
 	changesUpdated        time.Time
 	changesUpdateInterval time.Duration
 	// TODO replace with RWMutex
@@ -38,7 +39,6 @@ type Mng struct {
 func NewMng(containerId string) *Mng {
 	return &Mng{
 		id:                    containerId,
-		dockerAddr:            "unix:/var/run/docker.sock",
 		changesUpdateInterval: 1 * time.Second,
 		inodes:                NewIno(),
 		uid:                   uint32(os.Getuid()),
@@ -48,15 +48,15 @@ func NewMng(containerId string) *Mng {
 
 func (m *Mng) Init() (err error) {
 	if m.docker == nil {
-		httpc, err := NewClient(m.dockerAddr)
+		cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		if err != nil {
 			return err
 		}
-		m.docker = NewDockerMng(httpc, m.id)
+		m.docker = NewDockerMng(cli, m.id)
 	}
 
 	log.Printf("[debug] fetching container content...")
-	archPath, err := m.fetchContainerArchive()
+	archPath, err := m.fetchContainerArchive(context.Background())
 	if err != nil {
 		return err
 	}
@@ -74,19 +74,19 @@ func (m *Mng) Root() fs.InodeEmbedder {
 }
 
 // Fetch container archive and return path to tar-file.
-func (m *Mng) fetchContainerArchive() (path string, err error) {
-	respBody, err := m.docker.ContainerExport()
+func (m *Mng) fetchContainerArchive(ctx context.Context) (path string, err error) {
+	respBody, err := m.docker.ContainerExport(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer respBody.Close()
 
 	output, err := prepareOutputFile(m.id)
-	defer output.Close()
-
 	if err != nil {
 		return "", err
 	}
+	defer output.Close()
+
 	if _, err := io.Copy(output, respBody); err != nil {
 		return "", err
 	}
@@ -139,11 +139,11 @@ func parseContainterContent(file string) (map[string]os.FileMode, error) {
 	return result, nil
 }
 
-func (m *Mng) ChangesInDir(dir string) (result FsChanges, err error) {
+func (m *Mng) ChangesInDir(ctx context.Context, dir string) (result []container.ContainerChangeResponseItem, err error) {
 	m.changesMutex.Lock()
 	defer m.changesMutex.Unlock()
 	if m.changes == nil || time.Now().After(m.changesUpdated.Add(m.changesUpdateInterval)) {
-		changes, err := m.docker.GetFsChanges()
+		changes, err := m.docker.GetFsChanges(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -161,15 +161,16 @@ func (m *Mng) ChangesInDir(dir string) (result FsChanges, err error) {
 			// Not a direct child
 			continue
 		}
-		stat, err := m.docker.GetPathAttrs(change.Path)
-		if err != nil {
-			if !errors.As(err, &ErrorNotFound{}) {
-				log.Printf("[error] Failed to get raw attrs of %q: %v", change.Path, err)
-			}
-			continue
-		}
-		change.mode = uint32(stat.Mode)
+		/* 		stat, err := m.docker.GetPathAttrs(ctx, change.Path)
+		   		if err != nil {
+		   			if !errors.As(err, &ErrorNotFound{}) {
+		   				log.Printf("[error] Failed to get raw attrs of %q: %v", change.Path, err)
+		   			}
+		   			continue
+		   		}
+		   		change.mode = uint32(stat.Mode)
+		*/
 		result = append(result, change)
 	}
-	return FsChanges(result), nil
+	return result, nil
 }
